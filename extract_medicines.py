@@ -2,6 +2,7 @@
 """
 内服薬マスタPDFから医薬品情報を抽出してCSVに出力するスクリプト
 
+各薬品の説明ブロック内の記述を、区切り行の位置で4項目に振り分ける。
 出力列: 医薬品名, 効能, 注意事項, 使用方法, 保存方法
 """
 
@@ -47,16 +48,13 @@ DRUG_NAME_PATTERNS = [
     r'散$',
     r'液',
     r'シロップ',
-    # mg/錠のないブランド名：純粋なカタカナのみ・短い行
     r'^[ァ-ヶーｦ-ﾟ]{3,15}$',
 ]
 
-# 行全体がノイズである追加パターン（調剤数量表記など）
 LINE_NOISE_PATTERNS = [
     r'^＜全\s*\d+\s*(本|錠|包|mL|袋)\s*＞$',
 ]
 
-# 説明文中のインラインノイズ（文章の一部として現れる）
 INLINE_NOISE_PATTERNS = [
     r'＜全\s*\d+\s*(本|錠|包|mL|袋)\s*＞',
 ]
@@ -64,6 +62,28 @@ INLINE_NOISE_PATTERNS = [
 DOSAGE_PATTERN = re.compile(r'^1回\s+')
 FIELD_NAMES = ["医薬品名", "効能", "注意事項", "使用方法", "保存方法"]
 CONTENT_FIELDS = ["効能", "注意事項", "使用方法", "保存方法"]
+
+# ブロック内の区切り行（行頭がこのパターンなら新しい項目ブロックの開始）
+SECTION_STARTERS = [
+    ("保存方法", re.compile(
+        r'^(?:室温|高温|密閉|直射|湿気|光を避け|気密|冷暗所|冷蔵).{0,30}保存'
+        r'|.*保存(?:して|してください|下さい|ください)。?$'
+    )),
+    ("使用方法", re.compile(
+        r'^(?:獣医師の指示|獣医師から|空腹時に|食事や他の薬剤|受医師の指示)'
+    )),
+    ("注意事項", re.compile(
+        r'^(?:本剤投与後|本製品を使用後|本剤に直接|嗜好性が)'
+    )),
+    ("効能", re.compile(r'^(?:このお薬|この製品|複合)')),
+]
+
+# 1行の途中に複数項目が続く場合の分割位置
+INLINE_BOUNDARIES = re.compile(
+    r'(?=本剤投与後|本製品を使用後|本剤に直接|嗜好性が'
+    r'|獣医師の指示|獣医師から|空腹時に与えて|食事や他の薬剤|受医師の指示'
+    r'|(?:室温|高温|密閉|直射|湿気|光を避け|気密).{0,30}保存)'
+)
 
 
 def is_noise(line: str) -> bool:
@@ -90,57 +110,39 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
     return result.stdout
 
 
-def classify_sentence(sentence: str) -> str | None:
-    s = sentence.strip()
-    if not s or is_noise(s):
-        return None
+def clean_line(line: str) -> str:
+    text = line.strip()
+    for p in INLINE_NOISE_PATTERNS:
+        text = re.sub(p, '', text)
+    return re.sub(r'(?<=[　-鿿＀-￯])\s+(?=[　-鿿＀-￯])', '', text).strip()
 
-    if re.search(r'保存', s):
-        return "保存方法"
-    if s.startswith("本剤投与後") or "誤食してしまう危険性" in s:
-        return "注意事項"
-    if s.startswith("このお薬は") or re.match(r'^(複合|抗|免疫|止血|不整脈|ペニシリン)', s):
-        return "効能"
-    if (
-        s.startswith("獣医師")
-        or "空腹時に与えて" in s
-        or "投与を中止しない" in s
-        or "与えて下さい" in s
-        or "与えてください" in s
-        or "ご使用" in s
-    ):
-        return "使用方法"
-    if re.search(r'(剤|薬|治療|作用|特徴)', s) and not s.startswith("本剤"):
-        return "効能"
 
+def detect_section_start(line: str) -> str | None:
+    for field, pattern in SECTION_STARTERS:
+        if pattern.match(line):
+            return field
     return None
 
 
-def clean_japanese_spaces(text: str) -> str:
-    # 調剤数量表記を除去
-    for p in INLINE_NOISE_PATTERNS:
-        text = re.sub(p, '', text)
-    # 日本語文字間の不要なスペースを除去（改行由来）
-    return re.sub(r'(?<=[　-鿿＀-￯])\s+(?=[　-鿿＀-￯])', '', text)
-
-
-def split_into_sentences(text: str) -> list[str]:
-    parts = re.split(r'(?<=[。！？])\s*', text)
-    return [p.strip() for p in parts if p.strip()]
+def split_line_parts(line: str) -> list[str]:
+    parts = [p.strip() for p in INLINE_BOUNDARIES.split(line) if p.strip()]
+    return parts if parts else [line]
 
 
 def build_fields(desc_lines: list[str]) -> dict[str, str]:
     fields = {name: "" for name in CONTENT_FIELDS}
+    current = "効能"
 
-    body = clean_japanese_spaces(" ".join(desc_lines).strip())
-    for sentence in split_into_sentences(body):
-        category = classify_sentence(sentence)
-        if category is None:
+    for raw_line in desc_lines:
+        line = clean_line(raw_line)
+        if not line or is_noise(line):
             continue
-        if fields[category]:
-            fields[category] += " " + sentence
-        else:
-            fields[category] = sentence
+
+        for part in split_line_parts(line):
+            section = detect_section_start(part)
+            if section:
+                current = section
+            fields[current] = f"{fields[current]} {part}".strip() if fields[current] else part
 
     return fields
 
@@ -152,12 +154,11 @@ def has_any_content(fields: dict[str, str]) -> bool:
 def parse_drugs(text: str) -> list[dict]:
     drugs = []
     current_name = None
-    current_dosage = None
     current_desc_lines = []
     collecting = False
 
     def flush():
-        nonlocal current_name, current_dosage, current_desc_lines
+        nonlocal current_name, current_desc_lines
         if not current_name:
             return
 
@@ -166,7 +167,6 @@ def parse_drugs(text: str) -> list[dict]:
             drugs.append({"医薬品名": current_name, **fields})
 
         current_name = None
-        current_dosage = None
         current_desc_lines = []
 
     for raw_line in text.splitlines():
@@ -177,13 +177,10 @@ def parse_drugs(text: str) -> list[dict]:
         if is_drug_name(line):
             flush()
             current_name = line
-            current_dosage = None
             current_desc_lines = []
             collecting = True
         elif collecting:
-            if is_dosage(line) and current_dosage is None:
-                current_dosage = line
-            else:
+            if not is_dosage(line):
                 current_desc_lines.append(line)
 
     flush()
